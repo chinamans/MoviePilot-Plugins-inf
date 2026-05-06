@@ -35,6 +35,8 @@ from app.schemas.subscribe import Subscribe as SchemaSubscribe
 from app.schemas.types import EventType, ChainEventType, MediaType, NotificationType
 from app.utils.string import StringUtils
 
+from .recognition_guard import RecognitionGuard, RecognitionGuardConfig, RecognitionGuardDecision
+
 lock = threading.RLock()
 
 
@@ -46,7 +48,7 @@ class SubscribeAssistant(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/InfinityPacer/MoviePilot-Plugins/main/icons/subscribeassistant.png"
     # 插件版本
-    plugin_version = "2.8"
+    plugin_version = "2.9"
     # 插件作者
     plugin_author = "InfinityPacer"
     # 作者主页
@@ -57,6 +59,44 @@ class SubscribeAssistant(_PluginBase):
     plugin_order = 10
     # 可使用的用户级别
     auth_level = 1
+
+    # 真人版资源默认信号正则，优先覆盖站点副标题常见的人物/制作信息。
+    _DEFAULT_RECOGNITION_LIVE_ACTION_PATTERNS = "\n".join([
+        "电视剧版",
+        "真人版",
+        "主演[:：]",
+        "演员[:：]",
+        "导演[:：]",
+        "国剧",
+        "古装",
+    ])
+    # 动画资源默认信号正则，覆盖动漫、番剧和国漫站点常见描述。
+    _DEFAULT_RECOGNITION_ANIMATION_PATTERNS = "\n".join([
+        "动画",
+        "动漫",
+        "国漫",
+        "番剧",
+        "Bilibili",
+        "哔哩哔哩",
+    ])
+    # 电影资源默认信号正则，用于同名电影误入剧集订阅的保护。
+    _DEFAULT_RECOGNITION_MOVIE_PATTERNS = "\n".join([
+        "电影",
+        "剧场版",
+        "劇場版",
+        "\\bMovie\\b",
+    ])
+    # 剧集资源默认信号正则，用于同名剧集误入电影订阅的保护。
+    _DEFAULT_RECOGNITION_TV_PATTERNS = "\n".join([
+        "\\bS\\d{1,3}(?:E\\d{1,4})?\\b",
+        "第\\s*\\d+\\s*[集季]",
+        "全\\s*\\d+\\s*集",
+        "电视剧",
+        "剧集",
+        "劇集",
+        "\\bTV\\s*Series\\b",
+        "\\bSeason\\b",
+    ])
 
     # region 私有属性
     tmdb_chain = None
@@ -94,6 +134,34 @@ class SubscribeAssistant(_PluginBase):
     _download_timeout_retry_limit = 3
     # 连续超时达到上限后的单种忽略时间（小时）
     _download_timeout_ignore_hours = 48
+    # 识别增强模式
+    _recognition_guard_mode = "off"
+    # 识别增强目标形态
+    _recognition_guard_target_mode = "auto"
+    # 识别增强同名电影/剧集保护开关
+    _recognition_guard_same_name_protection = True
+    # 识别增强电影年份校验策略
+    _recognition_guard_movie_year_mode = "loose"
+    # 识别增强剧集年份校验策略
+    _recognition_guard_tv_year_mode = "season_first"
+    # 识别增强缺少年份处理策略
+    _recognition_guard_no_year_action = "allow"
+    # 识别增强 TMDB 二次识别策略
+    _recognition_guard_tmdb_recheck_mode = "off"
+    # 识别增强二次识别缓存上限
+    _recognition_guard_cache_maxsize = 1000
+    # 识别增强真人版信号正则
+    _recognition_guard_live_action_patterns = _DEFAULT_RECOGNITION_LIVE_ACTION_PATTERNS
+    # 识别增强动画信号正则
+    _recognition_guard_animation_patterns = _DEFAULT_RECOGNITION_ANIMATION_PATTERNS
+    # 识别增强电影信号正则
+    _recognition_guard_movie_patterns = _DEFAULT_RECOGNITION_MOVIE_PATTERNS
+    # 识别增强剧集信号正则
+    _recognition_guard_tv_patterns = _DEFAULT_RECOGNITION_TV_PATTERNS
+    # 识别增强强制放行正则
+    _recognition_guard_allow_patterns = ""
+    # 识别增强强制拦截正则
+    _recognition_guard_block_patterns = ""
     # 超时记录清理时间（小时）
     _timeout_history_cleanup = 24
     # 排除标签
@@ -195,6 +263,24 @@ class SubscribeAssistant(_PluginBase):
         self._download_timeout_progress_threshold = self.__get_float_config(
             config, "download_timeout_progress_threshold", 5)
         self._download_timeout_retry_limit = self.__get_int_config(config, "download_timeout_retry_limit", 3)
+        self._recognition_guard_mode = config.get("recognition_guard_mode", "off")
+        self._recognition_guard_target_mode = config.get("recognition_guard_target_mode", "auto")
+        self._recognition_guard_same_name_protection = config.get("recognition_guard_same_name_protection", True)
+        self._recognition_guard_movie_year_mode = config.get("recognition_guard_movie_year_mode", "loose")
+        self._recognition_guard_tv_year_mode = config.get("recognition_guard_tv_year_mode", "season_first")
+        self._recognition_guard_no_year_action = config.get("recognition_guard_no_year_action", "allow")
+        self._recognition_guard_tmdb_recheck_mode = config.get("recognition_guard_tmdb_recheck_mode", "off")
+        self._recognition_guard_cache_maxsize = self.__get_int_config(config, "recognition_guard_cache_maxsize", 1000)
+        self._recognition_guard_live_action_patterns = config.get(
+            "recognition_guard_live_action_patterns", self._DEFAULT_RECOGNITION_LIVE_ACTION_PATTERNS)
+        self._recognition_guard_animation_patterns = config.get(
+            "recognition_guard_animation_patterns", self._DEFAULT_RECOGNITION_ANIMATION_PATTERNS)
+        self._recognition_guard_movie_patterns = config.get(
+            "recognition_guard_movie_patterns", self._DEFAULT_RECOGNITION_MOVIE_PATTERNS)
+        self._recognition_guard_tv_patterns = config.get(
+            "recognition_guard_tv_patterns", self._DEFAULT_RECOGNITION_TV_PATTERNS)
+        self._recognition_guard_allow_patterns = config.get("recognition_guard_allow_patterns", "")
+        self._recognition_guard_block_patterns = config.get("recognition_guard_block_patterns", "")
         self._timeout_history_cleanup = self.__get_float_config(config, "timeout_history_cleanup", 0) or None
         self._auto_tv_pending_days = self.__get_float_config(config, "auto_tv_pending_days", 0) or None
         self._auto_tv_pending_episodes = self.__get_float_config(config, "auto_tv_pending_episodes", 0) or None
@@ -463,6 +549,13 @@ class SubscribeAssistant(_PluginBase):
                                     'value': 'best_tab'
                                 },
                                 'text': '订阅洗版'
+                            },
+                            {
+                                'component': 'VTab',
+                                'props': {
+                                    'value': 'recognition_guard_tab'
+                                },
+                                'text': '识别增强'
                             }
                         ]
                     },
@@ -1110,7 +1203,8 @@ class SubscribeAssistant(_PluginBase):
                                         ]
                                     }
                                 ]
-                            }
+                            },
+                            self.__get_recognition_guard_form()
                         ]
                     },
                     {
@@ -1276,6 +1370,281 @@ class SubscribeAssistant(_PluginBase):
             "auto_best_cron": "0 15 * * *",
             "tracker_response": self.__get_default_tracker_response(),
             "tracker_response_listen": True,
+            "recognition_guard_mode": "off",
+            "recognition_guard_target_mode": "auto",
+            "recognition_guard_same_name_protection": True,
+            "recognition_guard_movie_year_mode": "loose",
+            "recognition_guard_tv_year_mode": "season_first",
+            "recognition_guard_no_year_action": "allow",
+            "recognition_guard_tmdb_recheck_mode": "off",
+            "recognition_guard_cache_maxsize": 1000,
+            "recognition_guard_live_action_patterns": self._DEFAULT_RECOGNITION_LIVE_ACTION_PATTERNS,
+            "recognition_guard_animation_patterns": self._DEFAULT_RECOGNITION_ANIMATION_PATTERNS,
+            "recognition_guard_movie_patterns": self._DEFAULT_RECOGNITION_MOVIE_PATTERNS,
+            "recognition_guard_tv_patterns": self._DEFAULT_RECOGNITION_TV_PATTERNS,
+            "recognition_guard_allow_patterns": "",
+            "recognition_guard_block_patterns": "",
+        }
+
+    def __get_recognition_guard_form(self) -> dict:
+        """
+        拼装识别增强配置页签，集中管理下载前识别保护相关配置。
+        """
+        return {
+            'component': 'VWindowItem',
+            'props': {
+                'value': 'recognition_guard_tab'
+            },
+            'content': [
+                {
+                    'component': 'VRow',
+                    'props': {
+                        'style': {
+                            'margin-top': '0px'
+                        }
+                    },
+                    'content': [
+                        {
+                            'component': 'VCol',
+                            'props': {
+                                'cols': 12,
+                                'md': 4
+                            },
+                            'content': [
+                                {
+                                    'component': 'VSelect',
+                                    'props': {
+                                        'model': 'recognition_guard_mode',
+                                        'label': '识别增强模式',
+                                        'items': [
+                                            {'title': '关闭', 'value': 'off'},
+                                            {'title': '观察记录', 'value': 'observe'},
+                                            {'title': '保守拦截', 'value': 'conservative'},
+                                            {'title': '严格拦截', 'value': 'strict'},
+                                        ],
+                                        'hint': '默认关闭；观察模式仅记录和通知，不会移除资源',
+                                        'persistent-hint': True
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            'component': 'VCol',
+                            'props': {
+                                'cols': 12,
+                                'md': 4
+                            },
+                            'content': [
+                                {
+                                    'component': 'VSelect',
+                                    'props': {
+                                        'model': 'recognition_guard_target_mode',
+                                        'label': '目标形态',
+                                        'items': [
+                                            {'title': '自动', 'value': 'auto'},
+                                            {'title': '动画/动漫', 'value': 'animation'},
+                                            {'title': '真人版', 'value': 'live_action'},
+                                        ],
+                                        'hint': '订阅真人版但同名动画较多时，可手动选择真人版',
+                                        'persistent-hint': True
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            'component': 'VCol',
+                            'props': {
+                                'cols': 12,
+                                'md': 4
+                            },
+                            'content': [
+                                {
+                                    'component': 'VSwitch',
+                                    'props': {
+                                        'model': 'recognition_guard_same_name_protection',
+                                        'label': '同名类型保护',
+                                        'hint': '拦截电影/剧集同名互串，适用于自动订阅下载前',
+                                        'persistent-hint': True
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    'component': 'VRow',
+                    'content': [
+                        {
+                            'component': 'VCol',
+                            'props': {
+                                'cols': 12,
+                                'md': 3
+                            },
+                            'content': [
+                                {
+                                    'component': 'VSelect',
+                                    'props': {
+                                        'model': 'recognition_guard_movie_year_mode',
+                                        'label': '电影年份校验',
+                                        'items': [
+                                            {'title': '关闭', 'value': 'off'},
+                                            {'title': '宽松（前后一年）', 'value': 'loose'},
+                                            {'title': '严格一致', 'value': 'strict'},
+                                        ],
+                                        'hint': '电影默认要求年份存在，宽松模式兼容常见一年偏差',
+                                        'persistent-hint': True
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            'component': 'VCol',
+                            'props': {
+                                'cols': 12,
+                                'md': 3
+                            },
+                            'content': [
+                                {
+                                    'component': 'VSelect',
+                                    'props': {
+                                        'model': 'recognition_guard_tv_year_mode',
+                                        'label': '剧集年份校验',
+                                        'items': [
+                                            {'title': '关闭', 'value': 'off'},
+                                            {'title': '宽松（首播/分季均可）', 'value': 'loose'},
+                                            {'title': '订阅季优先', 'value': 'season_first'},
+                                            {'title': '订阅季严格', 'value': 'season_strict'},
+                                        ],
+                                        'hint': '兼容站点使用首播年份或分季年份标注剧集',
+                                        'persistent-hint': True
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            'component': 'VCol',
+                            'props': {
+                                'cols': 12,
+                                'md': 3
+                            },
+                            'content': [
+                                {
+                                    'component': 'VSelect',
+                                    'props': {
+                                        'model': 'recognition_guard_no_year_action',
+                                        'label': '缺少年份处理',
+                                        'items': [
+                                            {'title': '放行', 'value': 'allow'},
+                                            {'title': '观察记录', 'value': 'observe'},
+                                            {'title': '过滤', 'value': 'filter'},
+                                        ],
+                                        'hint': '部分站点不标年份，严格过滤前建议先观察',
+                                        'persistent-hint': True
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            'component': 'VCol',
+                            'props': {
+                                'cols': 12,
+                                'md': 3
+                            },
+                            'content': [
+                                {
+                                    'component': 'VSelect',
+                                    'props': {
+                                        'model': 'recognition_guard_tmdb_recheck_mode',
+                                        'label': 'TMDB二次识别',
+                                        'items': [
+                                            {'title': '关闭', 'value': 'off'},
+                                            {'title': '仅严格模式', 'value': 'strict'},
+                                            {'title': '保守/严格模式', 'value': 'conservative_strict'},
+                                            {'title': '观察/保守/严格', 'value': 'all'},
+                                        ],
+                                        'hint': '复用主程序识别缓存，确认候选资源是否指向其他 TMDB',
+                                        'persistent-hint': True
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    'component': 'VRow',
+                    'content': [
+                        {
+                            'component': 'VCol',
+                            'props': {
+                                'cols': 12,
+                                'md': 4
+                            },
+                            'content': [
+                                {
+                                    'component': 'VTextField',
+                                    'props': {
+                                        'model': 'recognition_guard_cache_maxsize',
+                                        'label': '二次识别缓存上限',
+                                        'type': 'number',
+                                        'min': '1',
+                                        'hint': '内存缓存按该值限制，Redis 环境复用统一缓存后端',
+                                        'persistent-hint': True
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                },
+                self.__get_recognition_guard_regex_row([
+                    ('recognition_guard_live_action_patterns', '真人信号正则',
+                     '每行一个正则；命中后认为候选资源偏真人版'),
+                    ('recognition_guard_animation_patterns', '动画信号正则',
+                     '每行一个正则；命中后认为候选资源偏动画/动漫'),
+                ]),
+                self.__get_recognition_guard_regex_row([
+                    ('recognition_guard_movie_patterns', '电影信号正则',
+                     '每行一个正则；命中后认为候选资源偏电影'),
+                    ('recognition_guard_tv_patterns', '剧集信号正则',
+                     '每行一个正则；命中后认为候选资源偏剧集'),
+                ]),
+                self.__get_recognition_guard_regex_row([
+                    ('recognition_guard_allow_patterns', '强制放行正则',
+                     '每行一个正则；命中后跳过识别增强拦截'),
+                    ('recognition_guard_block_patterns', '强制拦截正则',
+                     '每行一个正则；命中后直接按当前模式处理'),
+                ]),
+            ]
+        }
+
+    @staticmethod
+    def __get_recognition_guard_regex_row(items: List[Tuple[str, str, str]]) -> dict:
+        """
+        拼装识别增强正则输入行，减少配置表单中重复的 VTextarea 声明。
+        """
+        return {
+            'component': 'VRow',
+            'content': [
+                {
+                    'component': 'VCol',
+                    'props': {
+                        'cols': 12,
+                        'md': 6
+                    },
+                    'content': [
+                        {
+                            'component': 'VTextarea',
+                            'props': {
+                                'model': model,
+                                'label': label,
+                                'rows': 4,
+                                'hint': hint,
+                                'persistent-hint': True
+                            }
+                        }
+                    ]
+                }
+                for model, label, hint in items
+            ]
         }
 
     def get_page(self) -> List[dict]:
@@ -1359,6 +1728,175 @@ class SubscribeAssistant(_PluginBase):
         except (ValueError, TypeError):
             return default
 
+    @staticmethod
+    def __split_regex_patterns(value: Optional[str]) -> List[str]:
+        """
+        将多行正则配置拆分成可执行的正则列表。
+        """
+        if not value:
+            return []
+        return [pattern.strip() for pattern in str(value).splitlines() if pattern.strip()]
+
+    @staticmethod
+    def __normalize_choice(value: str, choices: set, default: str) -> str:
+        """
+        约束枚举型配置值，避免旧配置或手动编辑配置导致运行时出现非法模式。
+        """
+        return value if value in choices else default
+
+    def __get_recognition_guard_config(self) -> RecognitionGuardConfig:
+        """
+        构建识别增强配置对象，供资源选择和下载兜底链路复用。
+        """
+        mode = self.__normalize_choice(
+            self._recognition_guard_mode,
+            {"off", "observe", "conservative", "strict"},
+            "off",
+        )
+        return RecognitionGuardConfig(
+            mode=mode,
+            target_mode=self.__normalize_choice(
+                self._recognition_guard_target_mode,
+                {"auto", "animation", "live_action"},
+                "auto",
+            ),
+            same_name_protection=bool(self._recognition_guard_same_name_protection),
+            movie_year_mode=self.__normalize_choice(
+                self._recognition_guard_movie_year_mode,
+                {"off", "loose", "strict"},
+                "loose",
+            ),
+            tv_year_mode=self.__normalize_choice(
+                self._recognition_guard_tv_year_mode,
+                {"off", "loose", "season_first", "season_strict"},
+                "season_first",
+            ),
+            no_year_action=self.__normalize_choice(
+                self._recognition_guard_no_year_action,
+                {"allow", "observe", "filter"},
+                "allow",
+            ),
+            tmdb_recheck_mode=self.__normalize_choice(
+                self._recognition_guard_tmdb_recheck_mode,
+                {"off", "strict", "conservative_strict", "all"},
+                "off",
+            ),
+            cache_maxsize=max(1, int(self._recognition_guard_cache_maxsize or 1000)),
+            live_action_patterns=self.__split_regex_patterns(self._recognition_guard_live_action_patterns),
+            animation_patterns=self.__split_regex_patterns(self._recognition_guard_animation_patterns),
+            movie_patterns=self.__split_regex_patterns(self._recognition_guard_movie_patterns),
+            tv_patterns=self.__split_regex_patterns(self._recognition_guard_tv_patterns),
+            allow_patterns=self.__split_regex_patterns(self._recognition_guard_allow_patterns),
+            block_patterns=self.__split_regex_patterns(self._recognition_guard_block_patterns),
+        )
+
+    def __build_recognition_guard(self) -> RecognitionGuard:
+        """
+        创建识别增强器实例，并注入主程序识别函数以复用 TMDB 缓存。
+        """
+        return RecognitionGuard(
+            config=self.__get_recognition_guard_config(),
+            recognizer=self.__recognize_guard_candidate,
+        )
+
+    def __recognize_guard_candidate(self, meta, mtype: Optional[MediaType] = None) -> Optional[MediaInfo]:
+        """
+        使用主程序识别链路识别候选资源，识别增强只通过该入口触发二次识别。
+        """
+        try:
+            return self.chain.recognize_media(meta=meta, mtype=mtype, cache=True)
+        except Exception as err:
+            logger.warning(f"订阅识别增强二次识别异常：{getattr(meta, 'title', '')}，错误：{err}")
+            return None
+
+    def __handle_recognition_guard_decision(self, subscribe: Subscribe, decision: RecognitionGuardDecision,
+                                            context: Context):
+        """
+        记录识别增强命中结果，并在开启通知时向用户说明拦截或观察原因。
+        """
+        if not decision or not decision.observed:
+            return
+
+        action = "拦截" if decision.blocked else "观察"
+        logger.warning(f"{self.__format_subscribe(subscribe=subscribe)} 识别增强{action}资源："
+                       f"{decision.candidate_title}，原因：{decision.reason}")
+        if not self._notify:
+            return
+
+        torrent_info = context.torrent_info if context else None
+        text_parts = [
+            f"处理：{action}",
+            f"原因：{decision.reason}",
+        ]
+        if torrent_info and torrent_info.site_name:
+            text_parts.append(f"站点：{torrent_info.site_name}")
+        if torrent_info and torrent_info.description:
+            text_parts.append(f"副标题：{torrent_info.description}")
+        self.post_message(
+            mtype=NotificationType.Subscribe,
+            title=f"{self.__format_subscribe_desc(subscribe=subscribe)} 识别增强{action}",
+            text="\n".join(text_parts),
+            image=self.__get_subscribe_image(subscribe),
+        )
+
+    def __apply_recognition_guard_selection(self, event_data: ResourceSelectionEventData,
+                                            subscribe: Subscribe) -> bool:
+        """
+        在资源选择阶段过滤自动订阅候选资源，返回是否修改了候选列表。
+        """
+        guard = self.__build_recognition_guard()
+        if guard.config.mode == "off":
+            return False
+
+        if event_data.updated and event_data.updated_contexts is not None:
+            update_contexts = list(event_data.updated_contexts)
+        else:
+            update_contexts = list(event_data.contexts or [])
+
+        retained_contexts = []
+        for context in update_contexts:
+            decision = guard.evaluate(context)
+            if decision.observed:
+                self.__handle_recognition_guard_decision(
+                    subscribe=subscribe,
+                    decision=decision,
+                    context=context,
+                )
+            if not decision.blocked:
+                retained_contexts.append(context)
+        if len(retained_contexts) == len(update_contexts):
+            return False
+
+        event_data.updated = True
+        event_data.updated_contexts = retained_contexts
+        event_data.source = self.plugin_name
+        return True
+
+    def __apply_recognition_guard_download(self, event_data: ResourceDownloadEventData,
+                                           subscribe: Subscribe) -> bool:
+        """
+        在资源下载阶段做识别增强兜底校验，供后续评估是否启用。
+        """
+        guard = self.__build_recognition_guard()
+        if guard.config.mode == "off":
+            return False
+
+        decision = guard.evaluate(event_data.context)
+        if not decision.observed:
+            return False
+        self.__handle_recognition_guard_decision(
+            subscribe=subscribe,
+            decision=decision,
+            context=event_data.context,
+        )
+        if not decision.blocked:
+            return False
+
+        event_data.cancel = True
+        event_data.source = self.plugin_name
+        event_data.reason = decision.reason
+        return True
+
     def __update_config(self):
         """
         更新配置
@@ -1384,6 +1922,20 @@ class SubscribeAssistant(_PluginBase):
             "download_timeout": self._download_timeout,
             "download_timeout_progress_threshold": self._download_timeout_progress_threshold,
             "download_timeout_retry_limit": self._download_timeout_retry_limit,
+            "recognition_guard_mode": self._recognition_guard_mode,
+            "recognition_guard_target_mode": self._recognition_guard_target_mode,
+            "recognition_guard_same_name_protection": self._recognition_guard_same_name_protection,
+            "recognition_guard_movie_year_mode": self._recognition_guard_movie_year_mode,
+            "recognition_guard_tv_year_mode": self._recognition_guard_tv_year_mode,
+            "recognition_guard_no_year_action": self._recognition_guard_no_year_action,
+            "recognition_guard_tmdb_recheck_mode": self._recognition_guard_tmdb_recheck_mode,
+            "recognition_guard_cache_maxsize": self._recognition_guard_cache_maxsize,
+            "recognition_guard_live_action_patterns": self._recognition_guard_live_action_patterns,
+            "recognition_guard_animation_patterns": self._recognition_guard_animation_patterns,
+            "recognition_guard_movie_patterns": self._recognition_guard_movie_patterns,
+            "recognition_guard_tv_patterns": self._recognition_guard_tv_patterns,
+            "recognition_guard_allow_patterns": self._recognition_guard_allow_patterns,
+            "recognition_guard_block_patterns": self._recognition_guard_block_patterns,
             "timeout_history_cleanup": self._timeout_history_cleanup,
             "auto_tv_pending_days": self._auto_tv_pending_days,
             "auto_tv_pending_episodes": self._auto_tv_pending_episodes,
@@ -1777,6 +2329,9 @@ class SubscribeAssistant(_PluginBase):
                     event_data.source = self.plugin_name
                     return
 
+        # 自动订阅候选进入下载链路前先过滤同名真人/动画或电影/剧集互串资源。
+        self.__apply_recognition_guard_selection(event_data=event_data, subscribe=subscribe)
+
         # 跳过删除记录未开启
         if not self._skip_deletion:
             logger.debug("跳过删除记录功能未开启，跳过处理")
@@ -1788,7 +2343,10 @@ class SubscribeAssistant(_PluginBase):
 
         # 处理超时删除任务
         updated = False
-        update_contexts = event_data.updated_contexts or event_data.contexts or []
+        if event_data.updated and event_data.updated_contexts is not None:
+            update_contexts = event_data.updated_contexts
+        else:
+            update_contexts = event_data.contexts or []
         for context in list(update_contexts):
             torrent_info = context.torrent_info
             if not torrent_info:
@@ -1833,6 +2391,10 @@ class SubscribeAssistant(_PluginBase):
         if not subscribe_info or not subscribe:
             logger.debug(f"未能找到订阅信息，跳过处理")
             return
+
+        # 下载阶段兜底接入暂不启用；当前识别增强只在 ResourceSelection 阶段过滤自动订阅候选。
+        # if self.__apply_recognition_guard_download(event_data=event_data, subscribe=subscribe):
+        #     return
 
         self.__handle_resource_download_pending(subscribe=subscribe, context=context,
                                                 episodes=episodes, downloader=downloader)
