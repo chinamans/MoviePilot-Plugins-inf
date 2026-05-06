@@ -1,3 +1,4 @@
+import io
 import json
 import random
 import re
@@ -11,6 +12,7 @@ import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from packaging.version import Version
+from ruamel.yaml import YAML, YAMLError
 
 from app import schemas
 from app.chain.storage import StorageChain
@@ -35,6 +37,8 @@ from app.schemas.subscribe import Subscribe as SchemaSubscribe
 from app.schemas.types import EventType, ChainEventType, MediaType, NotificationType
 from app.utils.string import StringUtils
 
+from .recognition_guard import RecognitionGuard, RecognitionGuardConfig, RecognitionGuardDecision
+
 lock = threading.RLock()
 
 
@@ -46,7 +50,7 @@ class SubscribeAssistant(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/InfinityPacer/MoviePilot-Plugins/main/icons/subscribeassistant.png"
     # 插件版本
-    plugin_version = "2.8"
+    plugin_version = "2.9"
     # 插件作者
     plugin_author = "InfinityPacer"
     # 作者主页
@@ -94,6 +98,26 @@ class SubscribeAssistant(_PluginBase):
     _download_timeout_retry_limit = 3
     # 连续超时达到上限后的单种忽略时间（小时）
     _download_timeout_ignore_hours = 48
+    # 识别增强模式
+    _recognition_guard_mode = "off"
+    # 识别增强目标形态
+    _recognition_guard_target_mode = "auto"
+    # 识别增强命中后是否发送独立通知
+    _recognition_guard_notify = True
+    # 识别增强同名电影/剧集保护开关
+    _recognition_guard_same_name_protection = True
+    # 识别增强电影年份校验策略
+    _recognition_guard_movie_year_mode = "loose"
+    # 识别增强剧集年份校验策略
+    _recognition_guard_tv_year_mode = "season_first"
+    # 识别增强缺少年份处理策略
+    _recognition_guard_no_year_action = "allow"
+    # 识别增强 TMDB 二次识别策略
+    _recognition_guard_tmdb_recheck_mode = "off"
+    # 识别增强二次识别缓存上限
+    _recognition_guard_cache_maxsize = 100000
+    # 识别增强关键字 YAML 配置
+    _recognition_guard_keyword_config = ""
     # 超时记录清理时间（小时）
     _timeout_history_cleanup = 24
     # 排除标签
@@ -195,6 +219,24 @@ class SubscribeAssistant(_PluginBase):
         self._download_timeout_progress_threshold = self.__get_float_config(
             config, "download_timeout_progress_threshold", 5)
         self._download_timeout_retry_limit = self.__get_int_config(config, "download_timeout_retry_limit", 3)
+        self._recognition_guard_mode = config.get("recognition_guard_mode", "off")
+        self._recognition_guard_target_mode = config.get("recognition_guard_target_mode", "auto")
+        self._recognition_guard_notify = config.get("recognition_guard_notify", True)
+        same_name_protection_default = self.__get_bool_config(config, "recognition_guard_same_name_mode", True)
+        self._recognition_guard_same_name_protection = self.__get_bool_config(
+            config,
+            "recognition_guard_same_name_protection",
+            same_name_protection_default,
+        )
+        self._recognition_guard_movie_year_mode = config.get("recognition_guard_movie_year_mode", "loose")
+        self._recognition_guard_tv_year_mode = config.get("recognition_guard_tv_year_mode", "season_first")
+        self._recognition_guard_no_year_action = config.get("recognition_guard_no_year_action", "allow")
+        self._recognition_guard_tmdb_recheck_mode = config.get("recognition_guard_tmdb_recheck_mode", "off")
+        self._recognition_guard_cache_maxsize = self.__get_int_config(
+            config, "recognition_guard_cache_maxsize", 100000)
+        self._recognition_guard_keyword_config = config.get("recognition_guard_keyword_config")
+        if not self._recognition_guard_keyword_config:
+            self._recognition_guard_keyword_config = self.__get_default_recognition_guard_keyword_config()
         self._timeout_history_cleanup = self.__get_float_config(config, "timeout_history_cleanup", 0) or None
         self._auto_tv_pending_days = self.__get_float_config(config, "auto_tv_pending_days", 0) or None
         self._auto_tv_pending_episodes = self.__get_float_config(config, "auto_tv_pending_episodes", 0) or None
@@ -463,6 +505,13 @@ class SubscribeAssistant(_PluginBase):
                                     'value': 'best_tab'
                                 },
                                 'text': '订阅洗版'
+                            },
+                            {
+                                'component': 'VTab',
+                                'props': {
+                                    'value': 'recognition_guard_tab'
+                                },
+                                'text': '识别增强'
                             }
                         ]
                     },
@@ -1110,82 +1159,72 @@ class SubscribeAssistant(_PluginBase):
                                         ]
                                     }
                                 ]
-                            }
+                            },
+                            self.__get_recognition_guard_form()
                         ]
                     },
                     {
-                        'component': 'div',
+                        'component': 'VRow',
                         'props': {
                             'style': {
-                                'position': 'sticky',
-                                'bottom': '0',
-                                'z-index': '10',
-                                'margin-top': '12px',
-                                'padding-top': '12px',
-                                'padding-bottom': '1px',
-                                'background': 'rgb(var(--v-theme-surface))'
+                                'margin-top': '12px'
                             },
                         },
                         'content': [
                             {
-                                'component': 'VRow',
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                },
                                 'content': [
                                     {
-                                        'component': 'VCol',
+                                        'component': 'VAlert',
                                         'props': {
-                                            'cols': 12,
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'text': '注意：本插件仅支持 TMDB 数据源，相关订阅状态说明，请查阅 '
                                         },
                                         'content': [
                                             {
-                                                'component': 'VAlert',
+                                                'component': 'a',
                                                 'props': {
-                                                    'type': 'info',
-                                                    'variant': 'tonal',
-                                                    'text': '注意：本插件仅支持 TMDB 数据源，相关订阅状态说明，请查阅 '
+                                                    'href': 'https://github.com/jxxghp/MoviePilot/pull/3330',
+                                                    'target': '_blank'
                                                 },
                                                 'content': [
                                                     {
-                                                        'component': 'a',
-                                                        'props': {
-                                                            'href': 'https://github.com/jxxghp/MoviePilot/pull/3330',
-                                                            'target': '_blank'
-                                                        },
-                                                        'content': [
-                                                            {
-                                                                'component': 'u',
-                                                                'text': '#3330'
-                                                            }
-                                                        ]
+                                                        'component': 'u',
+                                                        'text': '#3330'
                                                     }
                                                 ]
                                             }
                                         ]
                                     }
                                 ]
-                            },
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'props': {
+                            'style': {
+                                'margin-top': '0'
+                            }
+                        },
+                        'content': [
                             {
-                                'component': 'VRow',
+                                'component': 'VCol',
                                 'props': {
-                                    'style': {
-                                        'margin-top': '0'
-                                    }
+                                    'cols': 12,
                                 },
                                 'content': [
                                     {
-                                        'component': 'VCol',
+                                        'component': 'VAlert',
                                         'props': {
-                                            'cols': 12,
-                                        },
-                                        'content': [
-                                            {
-                                                'component': 'VAlert',
-                                                'props': {
-                                                    'type': 'error',
-                                                    'variant': 'tonal',
-                                                    'text': '注意：本插件可能导致订阅数据异常，媒体文件丢失，相关风险请自行评估与承担'
-                                                }
-                                            }
-                                        ]
+                                            'type': 'error',
+                                            'variant': 'tonal',
+                                            'text': '注意：本插件可能导致订阅数据异常，媒体文件丢失，相关风险请自行评估与承担'
+                                        }
                                     }
                                 ]
                             }
@@ -1276,6 +1315,326 @@ class SubscribeAssistant(_PluginBase):
             "auto_best_cron": "0 15 * * *",
             "tracker_response": self.__get_default_tracker_response(),
             "tracker_response_listen": True,
+            "recognition_guard_mode": "off",
+            "recognition_guard_target_mode": "auto",
+            "recognition_guard_notify": True,
+            "recognition_guard_same_name_protection": True,
+            "recognition_guard_keyword_dialog": False,
+            "recognition_guard_movie_year_mode": "loose",
+            "recognition_guard_tv_year_mode": "season_first",
+            "recognition_guard_no_year_action": "allow",
+            "recognition_guard_tmdb_recheck_mode": "off",
+            "recognition_guard_cache_maxsize": 100000,
+            "recognition_guard_keyword_config": self.__get_default_recognition_guard_keyword_config(),
+        }
+
+    def __get_recognition_guard_form(self) -> dict:
+        """
+        拼装识别增强配置页签，集中管理下载前识别保护相关配置。
+        """
+        return {
+            'component': 'VWindowItem',
+            'props': {
+                'value': 'recognition_guard_tab'
+            },
+            'content': [
+                self.__get_recognition_guard_alert(
+                    'error',
+                    '实验性功能：识别增强会在自动订阅候选进入下载前，根据同名类型、目标形态、年份和 TMDB 二次识别结果过滤风险资源，可能导致订阅识别异常，建议先用观察记录确认命中情况。',
+                ),
+                {
+                    'component': 'VRow',
+                    'content': [
+                        self.__get_recognition_guard_control_col(
+                            self.__get_recognition_guard_select(
+                                'recognition_guard_mode',
+                                '识别增强模式',
+                                [
+                                    {'title': '关闭', 'value': 'off'},
+                                    {'title': '观察记录', 'value': 'observe'},
+                                    {'title': '保守拦截', 'value': 'conservative'},
+                                    {'title': '严格拦截', 'value': 'strict'},
+                                ],
+                                '控制命中风险后的处理方式，观察只写日志和通知，拦截会从候选中移除资源',
+                            ),
+                            md=3,
+                        ),
+                        self.__get_recognition_guard_control_col(
+                            self.__get_recognition_guard_switch(
+                                'recognition_guard_same_name_protection',
+                                '同名类型保护',
+                                '用于处理同名电影和剧集互串，命中对方类型关键字或二次识别类型不一致时过滤',
+                            ),
+                            md=3,
+                        ),
+                        self.__get_recognition_guard_control_col(
+                            self.__get_recognition_guard_switch(
+                                'recognition_guard_notify',
+                                '识别增强通知',
+                                '开启后命中观察或拦截时发送消息，需同时开启顶部发送通知',
+                            ),
+                            md=3,
+                        ),
+                        self.__get_recognition_guard_control_col(
+                            self.__get_recognition_guard_switch(
+                                'recognition_guard_keyword_dialog',
+                                '关键字配置',
+                                '点击弹出窗口以修改关键字配置',
+                            ),
+                            md=3,
+                        ),
+                    ]
+                },
+                {
+                    'component': 'VRow',
+                    'content': [
+                        self.__get_recognition_guard_control_col(
+                            self.__get_recognition_guard_select(
+                                'recognition_guard_tmdb_recheck_mode',
+                                'TMDB二次识别',
+                                [
+                                    {'title': '关闭', 'value': 'off'},
+                                    {'title': '仅严格模式', 'value': 'strict'},
+                                    {'title': '保守/严格模式', 'value': 'conservative_strict'},
+                                    {'title': '观察/保守/严格', 'value': 'all'},
+                                ],
+                                '调用主程序识别候选标题和副标题，用于校验 TMDBID、豆瓣ID、媒体类型和形态',
+                            ),
+                            md=4,
+                        ),
+                        self.__get_recognition_guard_control_col(
+                            self.__get_recognition_guard_text_field(
+                                'recognition_guard_cache_maxsize',
+                                '二次识别缓存上限',
+                                '内存缓存按该值限制条目数，Redis 后端按 TTL 过期，不同订阅自定义识别词会自动隔离缓存',
+                            ),
+                            md=4,
+                        ),
+                        self.__get_recognition_guard_control_col(
+                            self.__get_recognition_guard_select(
+                                'recognition_guard_target_mode',
+                                '目标形态',
+                                [
+                                    {'title': '自动', 'value': 'auto'},
+                                    {'title': '动画/动漫', 'value': 'animation'},
+                                    {'title': '真人/实拍', 'value': 'live_action'},
+                                ],
+                                '用于区分同名动画和真人实拍资源，自动按 TMDB 动画类型判断，必要时可手动指定',
+                            ),
+                            md=4,
+                        ),
+                    ]
+                },
+                {
+                    'component': 'VRow',
+                    'content': [
+                        self.__get_recognition_guard_control_col(
+                            self.__get_recognition_guard_select(
+                                'recognition_guard_movie_year_mode',
+                                '电影年份校验',
+                                [
+                                    {'title': '关闭', 'value': 'off'},
+                                    {'title': '宽松（前后一年）', 'value': 'loose'},
+                                    {'title': '严格一致', 'value': 'strict'},
+                                ],
+                                '用标题年份校验电影资源，宽松允许前后一年，严格要求与目标年份一致',
+                            ),
+                            md=4,
+                        ),
+                        self.__get_recognition_guard_control_col(
+                            self.__get_recognition_guard_select(
+                                'recognition_guard_tv_year_mode',
+                                '剧集年份校验',
+                                [
+                                    {'title': '关闭', 'value': 'off'},
+                                    {'title': '宽松（首播/分季均可）', 'value': 'loose'},
+                                    {'title': '订阅季优先', 'value': 'season_first'},
+                                    {'title': '订阅季严格', 'value': 'season_strict'},
+                                ],
+                                '用标题年份校验剧集资源，订阅季优先适合多季年份不同的剧集',
+                            ),
+                            md=4,
+                        ),
+                        self.__get_recognition_guard_control_col(
+                            self.__get_recognition_guard_select(
+                                'recognition_guard_no_year_action',
+                                '缺少年份处理',
+                                [
+                                    {'title': '放行', 'value': 'allow'},
+                                    {'title': '观察记录', 'value': 'observe'},
+                                    {'title': '过滤', 'value': 'filter'},
+                                ],
+                                '候选标题没有年份时的处理方式，站点常不标年份时建议放行或先观察',
+                            ),
+                            md=4,
+                        ),
+                    ]
+                },
+                self.__get_recognition_guard_keyword_dialog(),
+            ]
+        }
+
+    @staticmethod
+    def __get_recognition_guard_alert(alert_type: str, text: str) -> dict:
+        """
+        拼装识别增强顶部提示，集中说明功能生效范围。
+        """
+        return {
+            'component': 'VRow',
+            'props': {
+                'class': 'mt-0'
+            },
+            'content': [
+                {
+                    'component': 'VCol',
+                    'props': {
+                        'cols': 12,
+                    },
+                    'content': [
+                        {
+                            'component': 'VAlert',
+                            'props': {
+                                'type': alert_type,
+                                'variant': 'tonal',
+                                'density': 'compact',
+                                'text': text,
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+
+    @staticmethod
+    def __get_recognition_guard_control_col(component: dict, md: int = 3) -> dict:
+        """
+        拼装识别增强单个配置项列，调用方按当前行布局控制桌面列宽。
+        """
+        return {
+            'component': 'VCol',
+            'props': {
+                'cols': 12,
+                'md': md
+            },
+            'content': [
+                component
+            ]
+        }
+
+    @staticmethod
+    def __get_recognition_guard_select(model: str, label: str, items: List[dict], hint: str) -> dict:
+        """
+        拼装识别增强下拉配置项，沿用插件其他页签的提示和间距风格。
+        """
+        return {
+            'component': 'VSelect',
+            'props': {
+                'model': model,
+                'label': label,
+                'items': items,
+                'hint': hint,
+                'persistent-hint': True
+            }
+        }
+
+    @staticmethod
+    def __get_recognition_guard_switch(model: str, label: str, hint: str) -> dict:
+        """
+        拼装识别增强开关配置项，用于控制单个二元行为。
+        """
+        return {
+            'component': 'VSwitch',
+            'props': {
+                'model': model,
+                'label': label,
+                'hint': hint,
+                'persistent-hint': True
+            }
+        }
+
+    @staticmethod
+    def __get_recognition_guard_text_field(model: str, label: str, hint: str) -> dict:
+        """
+        拼装识别增强数字输入项，目前用于控制二次识别缓存上限。
+        """
+        return {
+            'component': 'VTextField',
+            'props': {
+                'model': model,
+                'label': label,
+                'type': 'number',
+                'min': '1',
+                'hint': hint,
+                'persistent-hint': True
+            }
+        }
+
+    def __get_recognition_guard_keyword_dialog(self) -> dict:
+        """
+        拼装识别增强关键字配置弹窗，避免 YAML 编辑器常驻配置页造成视觉负担。
+        """
+        return {
+            'component': 'VDialog',
+            'props': {
+                'model': 'recognition_guard_keyword_dialog',
+                'max-width': '65rem',
+                'overlay-class': 'v-dialog--scrollable v-overlay--scroll-blocked',
+                'content-class': 'v-card v-card--density-default v-card--variant-elevated rounded-t',
+            },
+            'content': [
+                {
+                    'component': 'VCard',
+                    'props': {
+                        'title': '设置识别增强关键字'
+                    },
+                    'content': [
+                        {
+                            'component': 'VDialogCloseBtn',
+                            'props': {
+                                'model': 'recognition_guard_keyword_dialog'
+                            }
+                        },
+                        {
+                            'component': 'VCardText',
+                            'content': [
+                                self.__get_recognition_guard_keyword_editor(),
+                                self.__get_recognition_guard_alert(
+                                    'info',
+                                    '每个列表项都会匹配标题、副标题、标签和站点分类，allow优先放行，block 按当前模式处理。',
+                                ),
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+
+    @staticmethod
+    def __get_recognition_guard_keyword_editor() -> dict:
+        """
+        拼装识别增强关键字 YAML 编辑器，参考种子分类与 H&R 的配置方式。
+        """
+        return {
+            'component': 'VRow',
+            'content': [
+                {
+                    'component': 'VCol',
+                    'props': {
+                        'cols': 12,
+                    },
+                    'content': [
+                        {
+                            'component': 'VAceEditor',
+                            'props': {
+                                'modelvalue': 'recognition_guard_keyword_config',
+                                'lang': 'yaml',
+                                'theme': 'monokai',
+                                'style': 'height: 24rem',
+                            }
+                        }
+                    ]
+                }
+            ]
         }
 
     def get_page(self) -> List[dict]:
@@ -1359,6 +1718,304 @@ class SubscribeAssistant(_PluginBase):
         except (ValueError, TypeError):
             return default
 
+    @staticmethod
+    def __get_bool_config(config: dict, key: str, default: bool) -> bool:
+        """
+        获取布尔配置项，兼容表单布尔值和旧配置字符串。
+        """
+        value = config.get(key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in {"true", "1", "yes", "on", "guard"}
+        return bool(value)
+
+    @staticmethod
+    def __get_default_recognition_guard_keyword_config() -> str:
+        """
+        获取识别增强关键字 YAML 默认配置，供首次安装使用。
+        """
+        return """####### 配置说明 BEGIN #######
+# 每个列表项都是关键字，按候选资源标题、副标题、标签和站点分类匹配。
+# live_action / animation 用于区分真人实拍与动画动漫。
+# movie / tv 用于区分同名电影与剧集。
+# allow 优先级最高，命中后跳过识别增强，block 命中后按当前模式直接处理。
+# 示例：
+# allow:
+#   - '官方合集'
+# block:
+#   - '错误作品关键字'
+####### 配置说明 END #######
+
+live_action:
+  - '电视剧版'
+  - '真人版'
+  - '真人'
+  - '实拍'
+  - '真人剧'
+  - '剧版'
+  - '主演'
+  - '演员'
+  - '国剧'
+  - '古装'
+
+animation:
+  - '动画'
+  - '动漫'
+  - '国漫'
+  - '番剧'
+  - 'Bilibili'
+  - '哔哩哔哩'
+
+movie:
+  - '电影'
+  - '剧场版'
+  - '劇場版'
+  - '\\bMovie\\b'
+
+tv:
+  - '\\bS\\d{1,3}(?:E\\d{1,4})?\\b'
+  - '第\\s*\\d+\\s*[集季]'
+  - '全\\s*\\d+\\s*集'
+  - '电视剧'
+  - '剧集'
+  - '劇集'
+  - '\\bTV\\s*Series\\b'
+  - '\\bSeason\\b'
+
+allow: []
+block: []
+"""
+
+    @staticmethod
+    def __normalize_keyword_patterns(value) -> List[str]:
+        """
+        将 YAML 中的关键字配置标准化为列表，兼容单个字符串和数组两种写法。
+        """
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [pattern.strip() for pattern in value.splitlines() if pattern.strip()]
+        if isinstance(value, list):
+            return [str(pattern).strip() for pattern in value if str(pattern).strip()]
+        logger.warning(f"识别增强关键字配置格式不支持：{value}")
+        return []
+
+    def __load_recognition_guard_keyword_config(self) -> Dict[str, List[str]]:
+        """
+        使用 safe loader 解析识别增强关键字 YAML 配置，返回识别器可直接使用的分组关键字。
+        """
+        config_str = self._recognition_guard_keyword_config or self.__get_default_recognition_guard_keyword_config()
+        yaml = YAML(typ="safe")
+        try:
+            data = yaml.load(io.StringIO(config_str)) or {}
+        except YAMLError as err:
+            logger.error(f"识别增强关键字 YAML 解析失败：{err}")
+            data = {}
+        except Exception as err:
+            logger.error(f"识别增强关键字配置解析异常：{err}")
+            data = {}
+
+        if not isinstance(data, dict):
+            logger.warning("识别增强关键字配置必须是 YAML 对象，已忽略当前配置")
+            data = {}
+
+        return {
+            "live_action": self.__normalize_keyword_patterns(data.get("live_action")),
+            "animation": self.__normalize_keyword_patterns(data.get("animation")),
+            "movie": self.__normalize_keyword_patterns(data.get("movie")),
+            "tv": self.__normalize_keyword_patterns(data.get("tv")),
+            "allow": self.__normalize_keyword_patterns(data.get("allow")),
+            "block": self.__normalize_keyword_patterns(data.get("block")),
+        }
+
+    @staticmethod
+    def __split_custom_words(value: Optional[str]) -> List[str]:
+        """
+        拆分订阅自定义识别词，供二次识别复用主程序候选识别的同一组订阅规则。
+        """
+        if not value:
+            return []
+        return [word.strip() for word in str(value).splitlines() if word.strip()]
+
+    @staticmethod
+    def __normalize_choice(value: str, choices: set, default: str) -> str:
+        """
+        约束枚举型配置值，避免旧配置或手动编辑配置导致运行时出现非法模式。
+        """
+        return value if value in choices else default
+
+    def __get_recognition_guard_config(self, subscribe: Optional[Subscribe] = None) -> RecognitionGuardConfig:
+        """
+        构建识别增强配置对象，供资源选择和下载兜底链路按订阅上下文复用。
+        """
+        mode = self.__normalize_choice(
+            self._recognition_guard_mode,
+            {"off", "observe", "conservative", "strict"},
+            "off",
+        )
+        keyword_patterns = self.__load_recognition_guard_keyword_config()
+        return RecognitionGuardConfig(
+            mode=mode,
+            target_mode=self.__normalize_choice(
+                self._recognition_guard_target_mode,
+                {"auto", "animation", "live_action"},
+                "auto",
+            ),
+            same_name_protection=bool(self._recognition_guard_same_name_protection),
+            movie_year_mode=self.__normalize_choice(
+                self._recognition_guard_movie_year_mode,
+                {"off", "loose", "strict"},
+                "loose",
+            ),
+            tv_year_mode=self.__normalize_choice(
+                self._recognition_guard_tv_year_mode,
+                {"off", "loose", "season_first", "season_strict"},
+                "season_first",
+            ),
+            no_year_action=self.__normalize_choice(
+                self._recognition_guard_no_year_action,
+                {"allow", "observe", "filter"},
+                "allow",
+            ),
+            tmdb_recheck_mode=self.__normalize_choice(
+                self._recognition_guard_tmdb_recheck_mode,
+                {"off", "strict", "conservative_strict", "all"},
+                "off",
+            ),
+            cache_maxsize=max(1, int(self._recognition_guard_cache_maxsize or 100000)),
+            custom_words=self.__split_custom_words(subscribe.custom_words if subscribe else None),
+            live_action_patterns=keyword_patterns["live_action"],
+            animation_patterns=keyword_patterns["animation"],
+            movie_patterns=keyword_patterns["movie"],
+            tv_patterns=keyword_patterns["tv"],
+            allow_patterns=keyword_patterns["allow"],
+            block_patterns=keyword_patterns["block"],
+        )
+
+    def __build_recognition_guard(self, subscribe: Optional[Subscribe] = None) -> RecognitionGuard:
+        """
+        创建识别增强器实例，并注入订阅自定义识别词与主程序识别函数。
+        """
+        return RecognitionGuard(
+            config=self.__get_recognition_guard_config(subscribe=subscribe),
+            recognizer=self.__recognize_guard_candidate,
+        )
+
+    def __recognize_guard_candidate(self, meta, mtype: Optional[MediaType] = None) -> Optional[MediaInfo]:
+        """
+        使用主程序识别链路识别候选资源，识别增强只通过该入口触发二次识别。
+        """
+        try:
+            return self.chain.recognize_media(meta=meta, mtype=mtype, cache=True)
+        except Exception as err:
+            logger.warning(f"订阅识别增强二次识别异常：{getattr(meta, 'title', '')}，错误：{err}")
+            return None
+
+    def __handle_recognition_guard_decision(self, subscribe: Subscribe, decision: RecognitionGuardDecision,
+                                            context: Context):
+        """
+        记录识别增强命中结果，并在开启通知时向用户说明拦截或观察原因。
+        """
+        if not decision or not decision.observed:
+            return
+
+        action = "拦截" if decision.blocked else "观察"
+        message = (f"{self.__format_subscribe(subscribe=subscribe)} 识别增强{action}资源："
+                   f"{decision.candidate_title}，原因：{decision.reason}")
+        if decision.blocked:
+            logger.warning(message)
+        else:
+            logger.info(message)
+        if not self._notify or not self._recognition_guard_notify:
+            return
+
+        torrent_info = context.torrent_info if context else None
+        text_parts = [
+            f"处理：{action}",
+            f"原因：{decision.reason}",
+        ]
+        if torrent_info and torrent_info.site_name:
+            text_parts.append(f"站点：{torrent_info.site_name}")
+        if torrent_info and torrent_info.description:
+            text_parts.append(f"副标题：{torrent_info.description}")
+        self.post_message(
+            mtype=NotificationType.Subscribe,
+            title=f"{self.__format_subscribe_desc(subscribe=subscribe)} 识别增强{action}",
+            text="\n".join(text_parts),
+            image=self.__get_subscribe_image(subscribe),
+        )
+
+    def __apply_recognition_guard_selection(self, event_data: ResourceSelectionEventData,
+                                            subscribe: Subscribe) -> bool:
+        """
+        在资源选择阶段过滤自动订阅候选资源，返回是否修改了候选列表。
+        """
+        guard = self.__build_recognition_guard(subscribe=subscribe)
+        if guard.config.mode == "off":
+            return False
+
+        if event_data.updated and event_data.updated_contexts is not None:
+            update_contexts = list(event_data.updated_contexts)
+        else:
+            update_contexts = list(event_data.contexts or [])
+
+        logger.debug(
+            f"{self.__format_subscribe(subscribe=subscribe)} 识别增强开始过滤候选资源，"
+            f"模式：{guard.config.mode}，候选数：{len(update_contexts)}"
+        )
+        retained_contexts = []
+        for context in update_contexts:
+            decision = guard.evaluate(context)
+            if decision.observed:
+                self.__handle_recognition_guard_decision(
+                    subscribe=subscribe,
+                    decision=decision,
+                    context=context,
+                )
+            if not decision.blocked:
+                retained_contexts.append(context)
+        if len(retained_contexts) == len(update_contexts):
+            logger.debug(
+                f"{self.__format_subscribe(subscribe=subscribe)} 识别增强未移除候选资源，"
+                f"候选数：{len(update_contexts)}"
+            )
+            return False
+
+        logger.info(
+            f"{self.__format_subscribe(subscribe=subscribe)} 识别增强已过滤候选资源，"
+            f"原始数：{len(update_contexts)}，保留数：{len(retained_contexts)}"
+        )
+        event_data.updated = True
+        event_data.updated_contexts = retained_contexts
+        event_data.source = self.plugin_name
+        return True
+
+    def __apply_recognition_guard_download(self, event_data: ResourceDownloadEventData,
+                                           subscribe: Subscribe) -> bool:
+        """
+        在资源下载阶段做识别增强兜底校验，供后续评估是否启用。
+        """
+        guard = self.__build_recognition_guard(subscribe=subscribe)
+        if guard.config.mode == "off":
+            return False
+
+        decision = guard.evaluate(event_data.context)
+        if not decision.observed:
+            return False
+        self.__handle_recognition_guard_decision(
+            subscribe=subscribe,
+            decision=decision,
+            context=event_data.context,
+        )
+        if not decision.blocked:
+            return False
+
+        event_data.cancel = True
+        event_data.source = self.plugin_name
+        event_data.reason = decision.reason
+        return True
+
     def __update_config(self):
         """
         更新配置
@@ -1384,6 +2041,16 @@ class SubscribeAssistant(_PluginBase):
             "download_timeout": self._download_timeout,
             "download_timeout_progress_threshold": self._download_timeout_progress_threshold,
             "download_timeout_retry_limit": self._download_timeout_retry_limit,
+            "recognition_guard_mode": self._recognition_guard_mode,
+            "recognition_guard_target_mode": self._recognition_guard_target_mode,
+            "recognition_guard_notify": self._recognition_guard_notify,
+            "recognition_guard_same_name_protection": self._recognition_guard_same_name_protection,
+            "recognition_guard_movie_year_mode": self._recognition_guard_movie_year_mode,
+            "recognition_guard_tv_year_mode": self._recognition_guard_tv_year_mode,
+            "recognition_guard_no_year_action": self._recognition_guard_no_year_action,
+            "recognition_guard_tmdb_recheck_mode": self._recognition_guard_tmdb_recheck_mode,
+            "recognition_guard_cache_maxsize": self._recognition_guard_cache_maxsize,
+            "recognition_guard_keyword_config": self._recognition_guard_keyword_config,
             "timeout_history_cleanup": self._timeout_history_cleanup,
             "auto_tv_pending_days": self._auto_tv_pending_days,
             "auto_tv_pending_episodes": self._auto_tv_pending_episodes,
@@ -1777,6 +2444,9 @@ class SubscribeAssistant(_PluginBase):
                     event_data.source = self.plugin_name
                     return
 
+        # 自动订阅候选进入下载链路前先过滤同名真人/动画或电影/剧集互串资源。
+        self.__apply_recognition_guard_selection(event_data=event_data, subscribe=subscribe)
+
         # 跳过删除记录未开启
         if not self._skip_deletion:
             logger.debug("跳过删除记录功能未开启，跳过处理")
@@ -1788,7 +2458,10 @@ class SubscribeAssistant(_PluginBase):
 
         # 处理超时删除任务
         updated = False
-        update_contexts = event_data.updated_contexts or event_data.contexts or []
+        if event_data.updated and event_data.updated_contexts is not None:
+            update_contexts = event_data.updated_contexts
+        else:
+            update_contexts = event_data.contexts or []
         for context in list(update_contexts):
             torrent_info = context.torrent_info
             if not torrent_info:
@@ -1833,6 +2506,10 @@ class SubscribeAssistant(_PluginBase):
         if not subscribe_info or not subscribe:
             logger.debug(f"未能找到订阅信息，跳过处理")
             return
+
+        # 下载阶段兜底接入暂不启用；当前识别增强只在 ResourceSelection 阶段过滤自动订阅候选。
+        # if self.__apply_recognition_guard_download(event_data=event_data, subscribe=subscribe):
+        #     return
 
         self.__handle_resource_download_pending(subscribe=subscribe, context=context,
                                                 episodes=episodes, downloader=downloader)
