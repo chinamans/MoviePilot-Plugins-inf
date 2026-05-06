@@ -1921,8 +1921,11 @@ block: []
             return
 
         action = "拦截" if decision.blocked else "观察"
+        torrent_info = context.torrent_info if context else None
+        description = torrent_info.description if torrent_info else None
+        description_text = f"｜{description}" if description else ""
         message = (f"{self.__format_subscribe(subscribe=subscribe)} 识别增强{action}资源："
-                   f"{decision.candidate_title}，原因：{decision.reason}")
+                   f"{decision.candidate_title}{description_text}，原因：{decision.reason}")
         if decision.blocked:
             logger.warning(message)
         else:
@@ -1930,7 +1933,6 @@ block: []
         if not self._notify or not self._recognition_guard_notify:
             return
 
-        torrent_info = context.torrent_info if context else None
         text_parts = [
             f"处理：{action}",
             f"原因：{decision.reason}",

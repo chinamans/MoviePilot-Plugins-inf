@@ -145,21 +145,21 @@ class RecognitionGuard:
         if direct_id_decision.observed:
             return direct_id_decision
 
-        recheck_decision = self._evaluate_secondary_recognition(context, media, candidate_title)
-        if recheck_decision.observed or recheck_decision.trusted:
-            return recheck_decision
-
         type_decision = self._evaluate_type_conflict(context, media, text, candidate_title)
         if type_decision.observed:
             return type_decision
 
-        shape_decision = self._evaluate_shape_conflict(media, text, candidate_title)
+        shape_decision = self._evaluate_shape_conflict(context, media, text, candidate_title)
         if shape_decision.observed:
             return shape_decision
 
         year_decision = self._evaluate_year(context, media, candidate_title)
         if year_decision.observed:
             return year_decision
+
+        recheck_decision = self._evaluate_secondary_recognition(context, media, candidate_title)
+        if recheck_decision.observed or recheck_decision.trusted:
+            return recheck_decision
 
         return RecognitionGuardDecision(candidate_title=candidate_title)
 
@@ -214,7 +214,8 @@ class RecognitionGuard:
             return self._make_decision("tv_movie_mismatch", "剧集订阅命中了电影资源信号", candidate_title)
         return RecognitionGuardDecision(candidate_title=candidate_title)
 
-    def _evaluate_shape_conflict(self, media: MediaInfo, text: str, candidate_title: str) -> RecognitionGuardDecision:
+    def _evaluate_shape_conflict(self, context: Context, media: MediaInfo, text: str,
+                                 candidate_title: str) -> RecognitionGuardDecision:
         """
         校验真人实拍/动画动漫信号，解决同名改编作品互串。
         """
@@ -224,6 +225,12 @@ class RecognitionGuard:
 
         live_action_match = self._match_patterns(self.config.live_action_patterns, text)
         animation_match = self._match_patterns(self.config.animation_patterns, text)
+        if live_action_match or animation_match:
+            logger.debug(
+                f"订阅识别增强目标形态校验：{self._candidate_log_text(context)}，"
+                f"目标形态：{target_shape}，真人信号：{live_action_match or '-'}，"
+                f"动画信号：{animation_match or '-'}"
+            )
         if target_shape == "animation" and live_action_match:
             return self._make_decision(
                 "animation_live_action_conflict",
@@ -407,37 +414,54 @@ class RecognitionGuard:
         if candidate_type in {MediaType.MOVIE, MediaType.TV}:
             meta.type = candidate_type
 
-        cache_key = self._recognition_cache_key(meta=meta, mtype=candidate_type)
+        cache_key = self._recognition_cache_key(meta=meta, mtype=candidate_type, context=context)
         cached = self._cache.get(cache_key)
         if cached is not None:
-            logger.debug(f"订阅识别增强二次识别命中缓存：{torrent_info.title}")
+            logger.debug(f"订阅识别增强二次识别命中缓存：{self._candidate_log_text(context)}")
             return self._cached_info_from_dict(cached)
 
         try:
-            logger.debug(f"订阅识别增强开始二次识别：{torrent_info.title}")
+            logger.debug(f"订阅识别增强开始二次识别：{self._candidate_log_text(context)}")
             mediainfo = self.recognizer(meta, candidate_type if candidate_type != MediaType.UNKNOWN else None)
         except Exception as err:
-            logger.warning(f"订阅识别增强二次识别失败：{torrent_info.title}，错误：{err}")
+            logger.warning(f"订阅识别增强二次识别失败：{self._candidate_log_text(context)}，错误：{err}")
             return None
         cached_info = self._cached_info_from_media(mediainfo)
         if cached_info:
             logger.debug(
-                f"订阅识别增强二次识别结果：{torrent_info.title} => "
+                f"订阅识别增强二次识别结果：{self._candidate_log_text(context)} => "
                 f"{cached_info.title} ({cached_info.year})，类型：{cached_info.type}，TMDBID：{cached_info.tmdb_id}"
             )
         else:
-            logger.debug(f"订阅识别增强二次识别无结果：{torrent_info.title}")
+            logger.debug(f"订阅识别增强二次识别无结果：{self._candidate_log_text(context)}")
         self._cache.set(cache_key, self._cached_info_to_dict(cached_info))
         return cached_info
 
-    def _recognition_cache_key(self, meta: MetaBase, mtype: Optional[MediaType]) -> str:
+    def _recognition_cache_key(self, meta: MetaBase, mtype: Optional[MediaType],
+                               context: Optional[Context] = None) -> str:
         """
-        生成二次识别缓存键，标题、年份和类型共同决定命中范围。
+        生成二次识别缓存键，按候选资源原始识别输入隔离缓存命中范围。
         """
         meta_name = getattr(meta, "name", None) or getattr(meta, "cn_name", None) or getattr(meta, "title", "")
         meta_year = getattr(meta, "year", "") or ""
         media_type = mtype.value if isinstance(mtype, MediaType) else ""
-        return f"{media_type}|{meta_year}|{self._custom_words_hash()}|{meta_name}"
+        input_hash = self._recognition_input_hash(meta=meta, mtype=mtype, context=context)
+        return f"{media_type}|{meta_year}|{self._custom_words_hash()}|{input_hash}|{meta_name}"
+
+    def _recognition_input_hash(self, meta: MetaBase, mtype: Optional[MediaType],
+                                context: Optional[Context] = None) -> str:
+        """
+        生成二次识别输入摘要，按主程序 RSS/搜索的站点资源粒度隔离缓存。
+        """
+        torrent_info = context.torrent_info if context else None
+        media_type = mtype.value if isinstance(mtype, MediaType) else ""
+        site_key = ""
+        if torrent_info:
+            site_key = str(torrent_info.site or torrent_info.site_name or "")
+        title = (torrent_info.title if torrent_info else getattr(meta, "title", "")) or ""
+        description = (torrent_info.description if torrent_info else getattr(meta, "subtitle", "")) or ""
+        raw_input = "\n".join([site_key, media_type, str(title), str(description)])
+        return hashlib.sha1(raw_input.encode("utf-8")).hexdigest()[:16]
 
     def _custom_words_hash(self) -> str:
         """
@@ -631,6 +655,18 @@ class RecognitionGuard:
         if not context or not context.torrent_info:
             return ""
         return context.torrent_info.title or ""
+
+    def _candidate_log_text(self, context: Optional[Context]) -> str:
+        """
+        拼装候选资源日志文本，统一展示标题与副标题方便排查命中原因。
+        """
+        if not context or not context.torrent_info:
+            return ""
+        torrent_info = context.torrent_info
+        desc = torrent_info.description or ""
+        if desc:
+            return f"{torrent_info.title or ''}｜{desc}"
+        return torrent_info.title or ""
 
     def _match_patterns(self, patterns: Sequence[str], text: str) -> Optional[str]:
         """
