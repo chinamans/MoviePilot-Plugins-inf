@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
@@ -19,7 +20,7 @@ class RecognitionGuardConfig:
     """
     # 工作模式：off 关闭、observe 仅记录、conservative 保守拦截、strict 严格拦截。
     mode: str = "off"
-    # 目标形态：auto 跟随 TMDB 类型、animation 强制按动画处理、live_action 强制按真人处理。
+    # 目标形态：auto 跟随 TMDB 类型、animation 强制按动画处理、live_action 强制按真人实拍处理。
     target_mode: str = "auto"
     # 是否启用同名电影/剧集互串保护。
     same_name_protection: bool = True
@@ -32,18 +33,20 @@ class RecognitionGuardConfig:
     # TMDB 二次识别策略：off 关闭、strict 仅严格模式、conservative_strict 保守/严格、all 观察也识别。
     tmdb_recheck_mode: str = "off"
     # 二次识别缓存上限；Redis 后端会沿用统一缓存能力，内存后端按该值限制。
-    cache_maxsize: int = 1000
-    # 真人版信号正则，任意命中即认为候选资源具有真人版特征。
+    cache_maxsize: int = 100000
+    # 当前订阅的自定义识别词，二次识别时与主程序订阅搜索保持一致。
+    custom_words: Sequence[str] = field(default_factory=list)
+    # 真人实拍关键字，任意命中即认为候选资源具有真人实拍特征。
     live_action_patterns: Sequence[str] = field(default_factory=list)
-    # 动画/动漫信号正则，任意命中即认为候选资源具有动画特征。
+    # 动画/动漫关键字，任意命中即认为候选资源具有动画特征。
     animation_patterns: Sequence[str] = field(default_factory=list)
-    # 电影信号正则，用于识别同名电影误入剧集订阅的场景。
+    # 电影关键字，用于识别同名电影误入剧集订阅的场景。
     movie_patterns: Sequence[str] = field(default_factory=list)
-    # 剧集信号正则，用于识别同名剧集误入电影订阅的场景。
+    # 剧集关键字，用于识别同名剧集误入电影订阅的场景。
     tv_patterns: Sequence[str] = field(default_factory=list)
-    # 强制放行正则，命中后跳过识别增强拦截。
+    # 强制放行关键字，命中后跳过识别增强拦截。
     allow_patterns: Sequence[str] = field(default_factory=list)
-    # 强制拦截正则，命中后直接按当前模式处理。
+    # 强制拦截关键字，命中后直接按当前模式处理。
     block_patterns: Sequence[str] = field(default_factory=list)
 
 
@@ -60,6 +63,8 @@ class RecognitionGuardDecision:
     reason: str = ""
     # 稳定的判定编码，便于后续定位或统计。
     code: str = "allow"
+    # 是否已经确认候选资源与订阅目标一致，用于跳过后续启发式校验避免误伤。
+    trusted: bool = False
     # 候选资源标题，通知中用于回看具体种子。
     candidate_title: str = ""
 
@@ -128,7 +133,7 @@ class RecognitionGuard:
         if matched_block:
             return self._make_decision(
                 "manual_block",
-                f"命中强制拦截正则：{matched_block}",
+                f"命中强制拦截关键字：{matched_block}",
                 candidate_title,
             )
 
@@ -139,6 +144,10 @@ class RecognitionGuard:
         direct_id_decision = self._evaluate_direct_ids(context, media, candidate_title)
         if direct_id_decision.observed:
             return direct_id_decision
+
+        recheck_decision = self._evaluate_secondary_recognition(context, media, candidate_title)
+        if recheck_decision.observed or recheck_decision.trusted:
+            return recheck_decision
 
         type_decision = self._evaluate_type_conflict(context, media, text, candidate_title)
         if type_decision.observed:
@@ -151,10 +160,6 @@ class RecognitionGuard:
         year_decision = self._evaluate_year(context, media, candidate_title)
         if year_decision.observed:
             return year_decision
-
-        recheck_decision = self._evaluate_secondary_recognition(context, media, candidate_title)
-        if recheck_decision.observed:
-            return recheck_decision
 
         return RecognitionGuardDecision(candidate_title=candidate_title)
 
@@ -211,7 +216,7 @@ class RecognitionGuard:
 
     def _evaluate_shape_conflict(self, media: MediaInfo, text: str, candidate_title: str) -> RecognitionGuardDecision:
         """
-        校验真人版/动画版信号，解决同名改编作品互串。
+        校验真人实拍/动画动漫信号，解决同名改编作品互串。
         """
         target_shape = self._target_shape(media)
         if target_shape == "unknown":
@@ -222,13 +227,13 @@ class RecognitionGuard:
         if target_shape == "animation" and live_action_match:
             return self._make_decision(
                 "animation_live_action_conflict",
-                f"动画目标命中真人版信号：{live_action_match}",
+                f"动画目标命中真人实拍信号：{live_action_match}",
                 candidate_title,
             )
         if target_shape == "live_action" and animation_match:
             return self._make_decision(
                 "live_action_animation_conflict",
-                f"真人版目标命中动画信号：{animation_match}",
+                f"真人实拍目标命中动画信号：{animation_match}",
                 candidate_title,
             )
         return RecognitionGuardDecision(candidate_title=candidate_title)
@@ -318,7 +323,15 @@ class RecognitionGuard:
                 candidate_title,
             )
         if self._is_same_identity(recognized, media):
-            return RecognitionGuardDecision(candidate_title=candidate_title)
+            logger.debug(
+                f"订阅识别增强二次识别确认同一目标：{candidate_title}，"
+                f"TMDBID={recognized.tmdb_id}，豆瓣ID={recognized.douban_id}"
+            )
+            return RecognitionGuardDecision(
+                candidate_title=candidate_title,
+                code="secondary_same_identity",
+                trusted=True,
+            )
         if recognized.type and media.type and recognized.type != media.type:
             return self._make_decision(
                 "secondary_type_mismatch",
@@ -336,7 +349,7 @@ class RecognitionGuard:
         if target_shape == "live_action" and self._is_animation_info(recognized):
             return self._make_decision(
                 "secondary_live_action_mismatch",
-                "真人版目标二次识别到动画资源",
+                "真人实拍目标二次识别到动画资源",
                 candidate_title,
             )
         return RecognitionGuardDecision(candidate_title=candidate_title)
@@ -385,7 +398,11 @@ class RecognitionGuard:
         torrent_info = context.torrent_info
         if not torrent_info or not torrent_info.title:
             return None
-        meta = MetaInfo(torrent_info.title, torrent_info.description)
+        meta = MetaInfo(
+            torrent_info.title,
+            torrent_info.description,
+            custom_words=list(self.config.custom_words or []),
+        )
         candidate_type = self._candidate_type(context, self._build_text(context))
         if candidate_type in {MediaType.MOVIE, MediaType.TV}:
             meta.type = candidate_type
@@ -393,14 +410,23 @@ class RecognitionGuard:
         cache_key = self._recognition_cache_key(meta=meta, mtype=candidate_type)
         cached = self._cache.get(cache_key)
         if cached is not None:
+            logger.debug(f"订阅识别增强二次识别命中缓存：{torrent_info.title}")
             return self._cached_info_from_dict(cached)
 
         try:
+            logger.debug(f"订阅识别增强开始二次识别：{torrent_info.title}")
             mediainfo = self.recognizer(meta, candidate_type if candidate_type != MediaType.UNKNOWN else None)
         except Exception as err:
             logger.warning(f"订阅识别增强二次识别失败：{torrent_info.title}，错误：{err}")
             return None
         cached_info = self._cached_info_from_media(mediainfo)
+        if cached_info:
+            logger.debug(
+                f"订阅识别增强二次识别结果：{torrent_info.title} => "
+                f"{cached_info.title} ({cached_info.year})，类型：{cached_info.type}，TMDBID：{cached_info.tmdb_id}"
+            )
+        else:
+            logger.debug(f"订阅识别增强二次识别无结果：{torrent_info.title}")
         self._cache.set(cache_key, self._cached_info_to_dict(cached_info))
         return cached_info
 
@@ -411,7 +437,16 @@ class RecognitionGuard:
         meta_name = getattr(meta, "name", None) or getattr(meta, "cn_name", None) or getattr(meta, "title", "")
         meta_year = getattr(meta, "year", "") or ""
         media_type = mtype.value if isinstance(mtype, MediaType) else ""
-        return f"{media_type}|{meta_year}|{meta_name}"
+        return f"{media_type}|{meta_year}|{self._custom_words_hash()}|{meta_name}"
+
+    def _custom_words_hash(self) -> str:
+        """
+        生成订阅自定义识别词摘要，避免不同订阅复用二次识别缓存导致串识别。
+        """
+        custom_words = [str(word).strip() for word in (self.config.custom_words or []) if str(word).strip()]
+        if not custom_words:
+            return ""
+        return hashlib.sha1("\n".join(custom_words).encode("utf-8")).hexdigest()[:12]
 
     def _cached_info_from_media(self, media: Optional[MediaInfo]) -> Optional[CachedRecognitionInfo]:
         """
@@ -484,7 +519,7 @@ class RecognitionGuard:
 
     def _candidate_type(self, context: Context, text: str) -> Optional[MediaType]:
         """
-        从站点分类、标题解析和用户正则中提取候选资源类型信号。
+        从站点分类、标题解析和用户关键字中提取候选资源类型信号。
         """
         torrent_info = context.torrent_info
         if torrent_info and torrent_info.category:
@@ -575,7 +610,7 @@ class RecognitionGuard:
 
     def _build_text(self, context: Context) -> str:
         """
-        拼接用户正则可匹配的候选资源文本。
+        拼接用户关键字可匹配的候选资源文本。
         """
         torrent_info = context.torrent_info if context else None
         if not torrent_info:
@@ -599,7 +634,7 @@ class RecognitionGuard:
 
     def _match_patterns(self, patterns: Sequence[str], text: str) -> Optional[str]:
         """
-        使用用户配置的正则列表匹配文本，非法正则只记录告警并跳过。
+        使用用户配置的关键字列表匹配文本，无法解析的关键字只记录告警并跳过。
         """
         if not text:
             return None
@@ -610,7 +645,7 @@ class RecognitionGuard:
                 if re.search(pattern, text, re.I):
                     return pattern
             except re.error as err:
-                logger.warning(f"订阅识别增强正则无效：{pattern}，错误：{err}")
+                logger.warning(f"订阅识别增强关键字无效：{pattern}，错误：{err}")
         return None
 
     @staticmethod
