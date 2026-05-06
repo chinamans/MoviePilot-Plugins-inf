@@ -1750,9 +1750,12 @@ class SubscribeAssistant(_PluginBase):
 live_action:
   - '电视剧版'
   - '真人版'
+  - '真人'
+  - '实拍'
+  - '真人剧'
+  - '剧版'
   - '主演'
   - '演员'
-  - '导演'
   - '国剧'
   - '古装'
 

@@ -322,6 +322,12 @@ class RecognitionGuard:
                 f"二次识别豆瓣ID {recognized.douban_id} 与订阅豆瓣ID {media.douban_id} 不一致",
                 candidate_title,
             )
+        if recognized.type and media.type and recognized.type != media.type:
+            return self._make_decision(
+                "secondary_type_mismatch",
+                f"二次识别类型 {recognized.type.value} 与订阅类型 {media.type.value} 不一致",
+                candidate_title,
+            )
         if self._is_same_identity(recognized, media):
             logger.debug(
                 f"订阅识别增强二次识别确认同一目标：{candidate_title}，"
@@ -331,12 +337,6 @@ class RecognitionGuard:
                 candidate_title=candidate_title,
                 code="secondary_same_identity",
                 trusted=True,
-            )
-        if recognized.type and media.type and recognized.type != media.type:
-            return self._make_decision(
-                "secondary_type_mismatch",
-                f"二次识别类型 {recognized.type.value} 与订阅类型 {media.type.value} 不一致",
-                candidate_title,
             )
 
         target_shape = self._target_shape(media)
@@ -359,7 +359,7 @@ class RecognitionGuard:
         判断二次识别结果是否已经明确指向目标媒体，避免后续形态信号误伤。
         """
         if recognized.tmdb_id and media.tmdb_id and int(recognized.tmdb_id) == int(media.tmdb_id):
-            return True
+            return bool(recognized.type and media.type and recognized.type == media.type)
         if recognized.douban_id and media.douban_id and str(recognized.douban_id) == str(media.douban_id):
             return True
         return False
